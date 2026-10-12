@@ -1,0 +1,14 @@
+#
+# Vehicle kill/arm state.
+# Publisher: CAN controller board (node 1), 20 Hz, priority 0.
+# Receivers MUST treat absence of this message for longer than their
+# kill timeout (default 250 ms) as killed.
+#
+# armed = !hard_kill && !soft_kill && host_ok
+#
+bool armed          # true = actuators may run
+bool hard_kill      # hardware kill switch asserted
+bool soft_kill      # software kill requested by the host
+bool host_ok        # host heartbeat currently present
+void4
+uint8 seq           # increments every message; lets receivers detect a stuck publisher
