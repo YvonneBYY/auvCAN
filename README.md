@@ -46,13 +46,6 @@ python3 tools/bench.py selftest mcast:0 10 --actuator
 python3 tools/bench.py monitor mcast:0              # or DroneCAN GUI Tool on "mcast:0"
 ```
 
-## Bench demo
-
-**On the Deft Controls PCB (G474RET6): follow `boards/bench_common/BRINGUP_DEFT_PCB.md`** — the bench
-`board_config.h` files use that profile by default. Two must-dos it covers: option bytes (FDCAN1 RX is
-the BOOT0 pin) and enabling FDCAN1 interrupt 0 (the Deft CubeMX project polls and leaves it off).
-For a Nucleo-64 instead, build with `-DBOARD_NO_HW_PROFILE` and read on.
-
 ### On two Nucleos
 
 Two G4 Nucleo-64s, two 3.3 V transceivers (standby pin tied low), twisted pair, 120 Ω at each end, common ground. PA12 = FDCAN1_TX → TXD, PA11 = FDCAN1_RX ← RXD. A USB-CAN adapter (gs_usb) on the bus is strongly recommended.
