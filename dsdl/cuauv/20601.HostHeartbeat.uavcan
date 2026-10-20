@@ -1,8 +1,0 @@
-#
-# Host liveness + soft kill request.
-# Publisher: Jetson host node (node 2), 10 Hz, from the CONTROL LOOP thread.
-# Consumer: CAN controller board, which publishes cuauv.Kill.
-#
-bool soft_kill      # true = host requests soft kill
-void7
-uint8 seq           # increments every message
