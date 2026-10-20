@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+sub.py - "enter the sub": a live terminal view of the whole auvCAN bus.
+
+    python tools/sub.py                 # launch the virtual sub on mcast:0 and enter it
+    python tools/sub.py --attach        # watch a bus that's already running (no launching)
+    python tools/sub.py --iface can0 --attach --no-host   # watch the real sub, change nothing
+
+By default this program
+  - starts every board as its own process (same set as tools/virtual_sub.sh),
+  - acts as the Jetson (node 2): HostHeartbeat at 10 Hz, RawCommand at 100 Hz,
+  - shows each board's status, the bus-wide Kill state, and an event log,
+  - stops every board it started when you quit.
+
+Keys
+  h        toggle hard kill (the controller's kill switch)
+  s        toggle soft kill (sent in our HostHeartbeat)
+  t        set thrust: six values, Orion units -255..255 (T1..T6)
+  0        zero thrust
+  up/down  select a board (or j / k)
+  p        power the selected board off / on   (boards this program started)
+  r        RestartNode the selected board      (it reboots and rejoins killed)
+  q        quit (stops the boards it started)
+
+    python tools/sub.py --snapshot 3    # no UI: run 3 s, print the screen once (scripts, CI)
+"""
+import argparse
+import curses
+import os
+import signal
+import subprocess
+import sys
+import time
+from collections import deque
+
+import bench                      # same directory: DSDL loading, types, constants, make_node
+
+Kill, HostHeartbeat, ThrusterStatus = bench.Kill, bench.HostHeartbeat, bench.ThrusterStatus
+NodeStatus, GetNodeInfo, RestartNode = bench.NodeStatus, bench.GetNodeInfo, bench.RestartNode
+
+OFFLINE_AFTER = 3.0               # catalogue: a node is gone after 3 s without NodeStatus
+KILL_TIMEOUT = 0.25               # actuators kill themselves after 250 ms without Kill
+REBOOT_EXIT_CODE = 42             # Linux builds exit with 42 on a valid RestartNode
+
+HEALTH = {0: "OK", 1: "WARNING", 2: "ERROR", 3: "CRITICAL"}
+
+# id, role, program, args.  program None = not launched by us.
+BOARDS = [
+    (1,  "controller", "bench_controller_host_linux", []),
+    (2,  "host",       None, []),
+    (10, "thruster A", "thruster_a_linux", []),
+    (11, "thruster B", "thruster_b_linux", []),
+    (20, "BMB",        "virtual_node", ["20", "edu.cornell.cuauv.bmb"]),
+    (21, "power",      "virtual_node", ["21", "edu.cornell.cuauv.power"]),
+    (30, "sensor",     "virtual_node", ["30", "edu.cornell.cuauv.sensor"]),
+    (31, "acoustics",  "virtual_node", ["31", "edu.cornell.cuauv.acoustics"]),
+]
+ACTUATORS = {10, 11}              # boards whose NodeStatus bit 0 means killed
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+class Board:
+    def __init__(self, nid, role, program, args):
+        self.id, self.role, self.program, self.args = nid, role, program, args
+        self.name = None
+        self.ns = None                # last NodeStatus
+        self.ns_t = None
+        self.status = None            # last ThrusterStatus
+        self.status_t = None
+        self.proc = None              # subprocess.Popen if we launched it
+        self.proc_state = "-"         # running / off / exited N / -
+        self.info_asked = 0.0
+        self.online = False
+
+    def seen_ago(self, now):
+        return None if self.ns_t is None else now - self.ns_t
+
+
+class Sub:
+    def __init__(self, a):
+        self.a = a
+        self.boards = {b[0]: Board(*b) for b in BOARDS}
+        self.events = deque(maxlen=200)
+        self.kill_msg, self.kill_t = None, None
+        self.hb_msg, self.hb_t = None, None       # HostHeartbeat seen on the bus (--no-host)
+        self.soft_kill = False
+        self.thrust = [0] * 6
+        self.hb_seq = 0
+        self.selected = 0
+        self.last_armed = None
+        self.prompt = None                        # text being typed for 't'
+        self.build = a.build
+        self.log_dir = a.log
+        self.t0 = time.monotonic()
+
+        self.node = bench.make_node(a.iface, bench.HOST_ID if a.host else bench.MONITOR_ID)
+        self.node.add_handler(NodeStatus, self._on_ns)
+        self.node.add_handler(Kill, self._on_kill)
+        self.node.add_handler(ThrusterStatus, self._on_thruster)
+        if a.host:
+            self.node.periodic(bench.HOST_HB_PERIOD, self._send_hb)
+            self.node.periodic(bench.RAWCMD_PERIOD, self._send_cmd)
+            self.boards[2].name = "this program"
+            self.boards[2].proc_state = "this UI"
+        else:
+            self.node.add_handler(HostHeartbeat, self._on_hb)
+
+    # ---- events -----------------------------------------------------------
+    def event(self, text):
+        self.events.append((time.monotonic() - self.t0, text))
+
+    # ---- bus handlers -----------------------------------------------------
+    def _on_ns(self, e):
+        nid = e.transfer.source_node_id
+        b = self.boards.get(nid)
+        if b is None:
+            b = self.boards[nid] = Board(nid, "unknown", None, [])
+            self.event("node %d appeared (not in the catalogue)" % nid)
+        prev = b.ns
+        b.ns, b.ns_t = e.message, time.monotonic()
+        if not b.online:
+            b.online = True
+            self.event("node %d (%s) online" % (nid, b.role))
+        if prev is not None and prev.uptime_sec > e.message.uptime_sec + 1:
+            self.event("node %d (%s) rebooted" % (nid, b.role))
+        if prev is not None and prev.health != e.message.health:
+            self.event("node %d health %s -> %s" % (nid, HEALTH.get(prev.health), HEALTH.get(e.message.health)))
+
+    def _on_kill(self, e):
+        if e.transfer.source_node_id != bench.CONTROLLER_ID:
+            self.event("Kill from node %d ignored: only node 1 may arm" % e.transfer.source_node_id)
+            return
+        self.kill_msg, self.kill_t = e.message, time.monotonic()
+        armed = bool(e.message.armed)
+        if armed != self.last_armed and self.last_armed is not None:
+            m = e.message
+            why = [w for w, on in (("hard kill", m.hard_kill), ("soft kill", m.soft_kill),
+                                   ("no host", not m.host_ok), ("node kill", m.node_kill)) if on]
+            self.event("BUS %s%s" % ("ARMED" if armed else "KILLED", "" if armed else " (" + ", ".join(why) + ")"))
+        self.last_armed = armed
+
+    def _on_thruster(self, e):
+        b = self.boards.get(e.transfer.source_node_id)
+        if b is not None:
+            b.status, b.status_t = e.message, time.monotonic()
+
+    def _on_hb(self, e):
+        if e.transfer.source_node_id == bench.HOST_ID:
+            self.hb_msg, self.hb_t = e.message, time.monotonic()
+
+    # ---- host role --------------------------------------------------------
+    def _send_hb(self):
+        self.node.broadcast(HostHeartbeat(soft_kill=self.soft_kill, seq=self.hb_seq), priority=bench.PRIO_HOST_HB)
+        self.hb_seq = (self.hb_seq + 1) & 0xFF
+
+    def _send_cmd(self):
+        raw = [max(-8192, min(8191, int(v) * bench.RAW_SCALE)) for v in self.thrust]
+        self.node.broadcast(bench.RawCommand(cmd=raw), priority=bench.PRIO_ACTUATOR)
+
+    # ---- processes --------------------------------------------------------
+    def exe(self, b):
+        return os.path.join(self.build, b.program)
+
+    def launch(self, b):
+        if b.program is None:
+            return
+        path = self.exe(b)
+        if not os.access(path, os.X_OK):
+            b.proc_state = "missing"
+            self.event("can't start %s: %s not built (cmake --build %s)" % (b.role, path, self.build))
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        log = open(os.path.join(self.log_dir, "%s.log" % b.role.replace(" ", "_")), "a")
+        b.proc = subprocess.Popen([path] + b.args, stdout=log, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, start_new_session=True)
+        log.close()
+        b.proc_state = "running"
+
+    def launch_all(self):
+        for b in self.boards.values():
+            if b.program is not None:
+                self.launch(b)
+        self.event("launched the virtual sub on %s (logs in %s)" % (self.a.iface, self.log_dir))
+
+    def stop(self, b, quiet=False):
+        if b.proc is not None and b.proc.poll() is None:
+            b.proc.terminate()
+            try:
+                b.proc.wait(1.0)
+            except subprocess.TimeoutExpired:
+                b.proc.kill()
+        b.proc = None
+        b.proc_state = "off"
+        if not quiet:
+            self.event("powered off %s (node %d)" % (b.role, b.id))
+
+    def stop_all(self):
+        for b in self.boards.values():
+            if b.proc is not None:
+                self.stop(b, quiet=True)
+
+    def reap(self):
+        for b in self.boards.values():
+            if b.proc is None:
+                continue
+            code = b.proc.poll()
+            if code is None:
+                continue
+            b.proc = None
+            if code == REBOOT_EXIT_CODE:
+                self.event("%s accepted RestartNode -> rebooting" % b.role)
+                self.launch(b)
+            else:
+                b.proc_state = "exited %d" % code
+                self.event("%s exited with code %d" % (b.role, code))
+
+    # ---- liveness ---------------------------------------------------------
+    def tick(self):
+        now = time.monotonic()
+        for b in self.boards.values():
+            if b.online and b.ns_t is not None and now - b.ns_t > OFFLINE_AFTER:
+                b.online = False
+                self.event("node %d (%s) OFFLINE: no NodeStatus for %.0f s" % (b.id, b.role, OFFLINE_AFTER))
+            if b.online and b.name is None and now - b.info_asked > 2.0 and b.id != self.node.node_id:
+                b.info_asked = now
+                self.node.request(GetNodeInfo.Request(), b.id, lambda e, b=b: self._on_info(b, e), timeout=1.0)
+        if self.kill_t is not None and self.last_armed and now - self.kill_t > KILL_TIMEOUT:
+            self.event("Kill stopped arriving: actuators kill themselves after 250 ms")
+            self.last_armed = False
+
+    def _on_info(self, b, e):
+        if e is None:
+            return
+        n = e.response.name
+        b.name = n.decode() if isinstance(n, (bytes, bytearray)) else str(n)
+
+    # ---- actions ----------------------------------------------------------
+    def selected_board(self):
+        ids = sorted(self.boards)
+        self.selected = max(0, min(self.selected, len(ids) - 1))
+        return self.boards[ids[self.selected]]
+
+    def toggle_hard_kill(self):
+        ctrl = self.boards[1]
+        pid = None
+        if ctrl.proc is not None and ctrl.proc.poll() is None:
+            pid = ctrl.proc.pid
+        else:
+            out = subprocess.run(["pgrep", "bench_controller"], capture_output=True, text=True).stdout.split()
+            if len(out) == 1:
+                pid = int(out[0])
+        if pid is None:
+            self.event("hard kill: no controller process to signal (a real sub has a physical switch)")
+            return
+        os.kill(pid, signal.SIGUSR1)
+        self.event("pressed the controller's kill switch")
+
+    def toggle_soft_kill(self):
+        if not self.a.host:
+            self.event("soft kill: --no-host, we aren't the Jetson")
+            return
+        self.soft_kill = not self.soft_kill
+        self.event("soft kill %s" % ("ON" if self.soft_kill else "off"))
+
+    def set_thrust(self, text):
+        try:
+            vals = [int(v) for v in text.replace(",", " ").split()]
+        except ValueError:
+            self.event("thrust: numbers only, e.g. 100 0 0 0 0 -50")
+            return
+        if not vals or len(vals) > 6 or not all(-255 <= v <= 255 for v in vals):
+            self.event("thrust: 1-6 values, each -255..255")
+            return
+        self.thrust = vals + [0] * (6 - len(vals))
+        self.event("thrust %s" % self.thrust)
+
+    def power_selected(self):
+        b = self.selected_board()
+        if b.program is None or not self.a.launch:
+            self.event("%s isn't a board this program started" % b.role)
+        elif b.proc is not None and b.proc.poll() is None:
+            self.stop(b)
+        else:
+            self.launch(b)
+            self.event("powered on %s (node %d)" % (b.role, b.id))
+
+    def restart_selected(self):
+        b = self.selected_board()
+        if b.id == self.node.node_id:
+            return
+        req = RestartNode.Request(magic_number=RestartNode.Request().MAGIC_NUMBER)
+        self.node.request(req, b.id, lambda e, b=b: self.event(
+            "RestartNode %s: %s" % (b.role, "no response" if e is None else "ok=%s" % bool(e.response.ok))),
+            timeout=1.0)
+        self.event("sent RestartNode to %s" % b.role)
+
+
+# ---------------------------------------------------------------------------
+# Rendering: a list of (text, style) lines, drawn by curses or printed
+# ---------------------------------------------------------------------------
+
+GOOD, BAD, WARN, DIM, BOLD, SEL, NORM = range(7)
+
+
+def fmt_age(t):
+    if t is None:
+        return "never"
+    return "%.1fs" % t if t < 10 else "%ds" % t
+
+
+def render(s, width):
+    now = time.monotonic()
+    L = []
+    add = lambda text, style=NORM: L.append((text[:width], style))
+
+    add("auvCAN sub  -  %s  -  %s" % (s.a.iface, "launched here" if s.a.launch else "attached"), BOLD)
+    add("")
+
+    # bus kill panel
+    k, kt = s.kill_msg, s.kill_t
+    if k is None:
+        add("BUS   no Kill from node 1 yet: every actuator stays killed", BAD)
+    elif now - kt > KILL_TIMEOUT:
+        add("BUS   KILLED  - no Kill from node 1 for %s (actuators time out at 0.25 s)" % fmt_age(now - kt), BAD)
+    else:
+        add("BUS   %s   (Kill from node 1, seq %d, %.2f s ago)" % ("ARMED " if k.armed else "KILLED", k.seq, now - kt),
+            GOOD if k.armed else BAD)
+    if k is not None:
+        nk = ("node %d" % k.node_kill_src) if k.node_kill else "none"
+        add("      hard kill: %-4s  soft kill: %-4s  host: %-7s  node kill: %s" % (
+            "ON" if k.hard_kill else "off", "ON" if k.soft_kill else "off",
+            "ok" if k.host_ok else "MISSING", nk))
+    if s.a.host:
+        add("HOST  we are node 2: soft kill %-4s  thrust T1-T6 %s" % ("ON" if s.soft_kill else "off", s.thrust),
+            WARN if s.soft_kill else NORM)
+    elif s.hb_msg is not None:
+        add("HOST  node 2 heartbeat %s ago, soft kill %s" % (fmt_age(now - s.hb_t), "ON" if s.hb_msg.soft_kill else "off"))
+    else:
+        add("HOST  no HostHeartbeat seen", WARN)
+    add("")
+
+    # board table
+    add("%-3s %-11s %-8s %-8s %7s %6s %-10s %s" % ("ID", "BOARD", "STATE", "HEALTH", "UPTIME", "SEEN", "PROCESS", "DETAIL"), BOLD)
+    ids = sorted(s.boards)
+    for i, nid in enumerate(ids):
+        b = s.boards[nid]
+        ago = b.seen_ago(now)
+        if nid == s.node.node_id:
+            state, health, up, seen, style = "-", "-", "-", "-", NORM
+        elif b.ns is None or not b.online:
+            state = "OFFLINE" if b.ns is not None else "--"
+            health, up, seen, style = "-", "-", fmt_age(ago), DIM
+        else:
+            # Kill state from the fastest source available: ThrusterStatus (20 Hz) for
+            # thrusters, the Kill message itself (20 Hz) for the controller, else
+            # NodeStatus bit 0 (1 Hz) - so STATE and DETAIL never disagree.
+            if nid in ACTUATORS and b.status_t is not None and now - b.status_t < 0.5:
+                state = "KILLED" if b.status.killed else "ARMED"
+            elif nid == bench.CONTROLLER_ID and kt is not None and now - kt < KILL_TIMEOUT:
+                state = "ARMED" if k.armed else "KILLED"
+            elif nid in ACTUATORS or nid == bench.CONTROLLER_ID:
+                state = "KILLED" if (b.ns.vendor_specific_status_code & 1) else "ARMED"
+            else:
+                state = "up"
+            health = HEALTH.get(b.ns.health, str(b.ns.health))
+            up, seen = "%ds" % b.ns.uptime_sec, fmt_age(ago)
+            style = BAD if state == "KILLED" else GOOD if state == "ARMED" else NORM
+            if b.ns.health >= 1:
+                style = WARN
+        detail = ""
+        if b.status is not None and b.online:
+            st = b.status
+            detail = "applied %s" % " ".join("%4d" % v for v in st.applied)
+            detail += "  KILLED" if st.killed else ""
+            detail += "  STALE" if st.stale else ""
+        elif nid == bench.CONTROLLER_ID and k is not None and b.online:
+            detail = "publishing %s" % ("armed" if k.armed else "killed")
+        elif b.name:
+            detail = b.name
+        line = "%-3d %-11s %-8s %-8s %7s %6s %-10s %s" % (nid, b.role[:11], state, health, up, seen, b.proc_state[:10], detail)
+        L.append((line[:width], SEL if i == s.selected else style))
+    add("")
+
+    # keys / prompt
+    if s.prompt is not None:
+        add("thrust T1..T6 (Orion units, -255..255), Enter to send, Esc to cancel: " + s.prompt, BOLD)
+    else:
+        add("[h] hard kill  [s] soft kill  [t] thrust  [0] zero  [up/down or j/k] select  "
+            "[p] power  [r] restart  [q] quit", DIM)
+    add("")
+    add("EVENTS", BOLD)
+    return L
+
+
+def snapshot_text(s, width=110):
+    return "\n".join(t for t, _ in render(s, width)) + "\n" + "\n".join(
+        "  %7.2fs  %s" % e for e in list(s.events)[-12:])
+
+
+# ---------------------------------------------------------------------------
+# curses UI
+# ---------------------------------------------------------------------------
+
+def ui(stdscr, s):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
+    curses.use_default_colors()
+    pairs = {GOOD: curses.COLOR_GREEN, BAD: curses.COLOR_RED, WARN: curses.COLOR_YELLOW}
+    attr = {NORM: curses.A_NORMAL, BOLD: curses.A_BOLD, DIM: curses.A_DIM, SEL: curses.A_REVERSE}
+    if curses.has_colors():
+        for i, (style, color) in enumerate(pairs.items(), start=1):
+            curses.init_pair(i, color, -1)
+            attr[style] = curses.color_pair(i) | curses.A_BOLD
+    else:
+        attr.update({GOOD: curses.A_BOLD, BAD: curses.A_BOLD, WARN: curses.A_NORMAL})
+
+    def put(y, x, text, a=curses.A_NORMAL):
+        h, w = stdscr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                stdscr.addstr(y, x, text[:max(0, w - x - 1)], a)
+            except curses.error:
+                pass
+
+    next_draw = 0.0
+    while True:
+        s.node.spin(0.01)
+        s.reap()
+        s.tick()
+
+        ch = stdscr.getch()
+        while ch != -1:
+            if s.prompt is not None:
+                if ch in (10, 13, curses.KEY_ENTER):
+                    s.set_thrust(s.prompt); s.prompt = None
+                elif ch == 27:
+                    s.prompt = None
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    s.prompt = s.prompt[:-1]
+                elif 32 <= ch < 127:
+                    s.prompt += chr(ch)
+            elif ch in (ord("q"), ord("Q")):
+                return
+            elif ch == ord("h"):
+                s.toggle_hard_kill()
+            elif ch == ord("s"):
+                s.toggle_soft_kill()
+            elif ch == ord("t"):
+                s.prompt = ""
+            elif ch == ord("0"):
+                s.set_thrust("0")
+            elif ch in (curses.KEY_UP, ord("k")):
+                s.selected -= 1; s.selected_board()
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                s.selected += 1; s.selected_board()
+            elif ch == ord("p"):
+                s.power_selected()
+            elif ch == ord("r"):
+                s.restart_selected()
+            ch = stdscr.getch()
+
+        now = time.monotonic()
+        if now >= next_draw:
+            next_draw = now + 0.1
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
+            lines = render(s, w - 1)
+            for y, (text, style) in enumerate(lines):
+                put(y, 0, text, attr[style])
+            room = h - len(lines) - 1
+            for i, (t, text) in enumerate(list(s.events)[-max(room, 0):] if room > 0 else []):
+                put(len(lines) + i, 0, "  %7.2fs  %s" % (t, text), curses.A_NORMAL)
+            stdscr.refresh()
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--iface", default="mcast:0", help="bus: mcast:0 (virtual), can0 (real)")
+    p.add_argument("--attach", dest="launch", action="store_false",
+                   help="don't start boards; watch whatever is already on the bus")
+    p.add_argument("--no-host", dest="host", action="store_false",
+                   help="don't act as the Jetson (node 2); observe only")
+    p.add_argument("--build", default=os.path.join(here, "..", "build"), help="where the board programs are")
+    p.add_argument("--log", default="/tmp/auvcan_sub", help="board logs directory")
+    p.add_argument("--snapshot", type=float, metavar="SECONDS",
+                   help="no UI: run this long, print one screen, exit")
+    a = p.parse_args()
+    a.build = os.path.abspath(a.build)
+
+    if a.launch and not a.iface.startswith("mcast"):
+        p.error("launching boards only makes sense on the virtual bus; use --attach with %s" % a.iface)
+
+    s = Sub(a)
+    try:
+        if a.launch:
+            s.launch_all()
+        if a.snapshot is not None:
+            end = time.monotonic() + a.snapshot
+            while time.monotonic() < end:
+                s.node.spin(0.01); s.reap(); s.tick()
+            print(snapshot_text(s))
+        else:
+            curses.wrapper(ui, s)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s.stop_all()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

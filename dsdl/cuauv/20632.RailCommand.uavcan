@@ -1,0 +1,7 @@
+#
+# Publisher: Host (node 2), 1 Hz and on change. Consumer: Power (node 21).
+# Rails hold their last state if the host is lost. Bit n = rail n (RailCurrents order).
+#
+uint16 enable_mask
+uint16 priv_mask    # Orion PD Priv: exempt from the over-current trip
+uint8 seq

@@ -1,0 +1,7 @@
+#
+# Publisher: Power (node 21), 10 Hz.
+# Fixed rail order (freeze against the Power schematic):
+#   0-5   5 V:  Serial, X1, X3, Switch, Sens, X2
+#   6-14  12 V: XMIT, H2O, Sens, X1, DownCam, GX, ForeCam, X2, DVL
+#
+float16[15] current_a

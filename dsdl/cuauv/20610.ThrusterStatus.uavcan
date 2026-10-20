@@ -1,0 +1,9 @@
+#
+# Thruster board output. Publisher: Thruster A (10) / B (11), 20 Hz.
+# The board is identified by the source node ID; applied[i] is that board's
+# i-th thruster (its slice of RawCommand.cmd is a parameter).
+#
+int16[3] applied    # output after ramp, Orion units -255..255; 0 while killed
+bool killed
+bool stale          # no RawCommand for 200 ms
+void6

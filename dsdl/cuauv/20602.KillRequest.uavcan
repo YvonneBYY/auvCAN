@@ -1,0 +1,14 @@
+#
+# Secondary kill request.
+# Publishers: BMB (node 20), Power (node 21). 2 Hz while active, and on every change.
+# Consumer: Controller, which folds it into cuauv.Kill.node_kill.
+#
+uint8 REASON_BATTERY_FAULT = 1
+uint8 REASON_OVERTEMP      = 2
+uint8 REASON_UNDERVOLTAGE  = 4
+uint8 REASON_OVERCURRENT   = 8
+
+bool active
+void7
+uint8 reason        # bitmask of REASON_*
+uint8 seq

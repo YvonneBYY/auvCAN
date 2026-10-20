@@ -1,4 +1,4 @@
-# auvCAN core — v0.3 (core + bench node/controller apps + Deft PCB profile)
+# auvCAN core — v0.3.3 (core + bench node/controller apps + Deft PCB profile)
 
 auvCAN = **DroneCAN v0 on CAN 2.0B at 1 Mbps** + the `cuauv.*` message namespace + the safety conventions carried over from toucan/serial (kill watchdog, host timeout, one config per board).
 
@@ -29,6 +29,9 @@ generated/                  C code from dronecan_dsdlc (uavcan.* + cuauv.*)
 tests/test_core.c           213 checks on the simulated bus
 tools/virtual_node.c        run the real core as a board on your laptop
 tools/bench.py              monitor / kill publisher / host heartbeat / restart / bring-up selftest
+tools/sub.py                "enter the sub": launches every board on mcast:0, acts as the Jetson,
+                            live board table + bus kill state; h/s/t/p/r keys (see --help)
+tools/virtual_sub.sh        the same set of boards without the UI, logs followed in the terminal
 tools/fetch_deps.sh         generator deps (DSDL + dronecan_dsdlc) at pinned commits
 third_party/libcanard/      libcanard @601ed35, vendored (3 files + LICENSE) — builds offline
 ```
@@ -45,6 +48,14 @@ cmake -S . -B build && cmake --build build
 python3 tools/bench.py selftest mcast:0 10 --actuator
 python3 tools/bench.py monitor mcast:0              # or DroneCAN GUI Tool on "mcast:0"
 ```
+
+## Bench demo
+
+**On the Deft Controls PCB (G474RET6): follow `boards/bench_common/BRINGUP_DEFT_PCB.md`** — the bench
+`board_config.h` files use that profile by default. Two must-dos it covers: option bytes (FDCAN1 RX is
+the BOOT0 pin) and enabling FDCAN1 interrupt 0 (the Deft CubeMX project polls and leaves it off).
+**On NUCLEO-G431KB (Nucleo-32): follow `boards/bench_common/BRINGUP_NUCLEO_G431KB.md`** and define
+`BOARD_HW_NUCLEO_G431KB`. For a Nucleo-64 instead, build with `-DBOARD_NO_HW_PROFILE` and read on.
 
 ### On two Nucleos
 

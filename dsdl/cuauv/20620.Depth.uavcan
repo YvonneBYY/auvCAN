@@ -1,0 +1,7 @@
+#
+# Publisher: Sensor (node 30), 50 Hz.
+#
+float32 depth_m
+float16 water_temp_c
+bool sensor_ok
+void7

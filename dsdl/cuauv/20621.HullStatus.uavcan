@@ -1,0 +1,9 @@
+#
+# Publisher: Sensor (node 30), 10 Hz at priority 12, and immediately on any
+# leak change at priority 2. Report only: no node acts on a leak.
+#
+float32 hull_pressure_atm   # float32 for slow-leak resolution
+float16 internal_temp_c
+bool[4] leak
+bool pressure_sensor_ok
+void3

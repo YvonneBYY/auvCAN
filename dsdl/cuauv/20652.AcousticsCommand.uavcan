@@ -1,0 +1,10 @@
+#
+# Publisher: Host (node 2), 1 Hz and on change. Consumer: Acoustics (node 31).
+# Idempotent state, so no seq: 7 bytes keeps it in one frame.
+#
+uint16 track_freq_khz
+uint16 comms_freq_khz
+uint8 tracking_pinger
+uint8 freq_select
+bool transmit_enable
+void7
