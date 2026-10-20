@@ -92,55 +92,6 @@ The table's STATE comes from the fastest source: ThrusterStatus and Kill at 20 H
 
 `boards/thruster/` is the first real board app. Build Thruster B with `-DTHRUSTER_B`. It ports Orion's `thrusters.c` with three fixes: a kill zeroes the ramp (re-arm ramps up from 0), `applied` reads 0 while killed, and ramp inc/dec are spin-up/spin-down. Polarity, ramp rates and the `cmd[]` offset are `#define`s in `board_config.h` until stage 3. Details, the behaviour table and G4 bring-up: `boards/thruster/README.md`. Scope the PWM pins before connecting an ESC.
 
-## Bench demo
-
-**On the Deft Controls PCB (G474RET6): follow `boards/bench_common/BRINGUP_DEFT_PCB.md`** — the bench
-`board_config.h` files use that profile by default. Two must-dos it covers: option bytes (FDCAN1 RX is
-the BOOT0 pin) and enabling FDCAN1 interrupt 0 (the Deft CubeMX project polls and leaves it off).
-**On NUCLEO-G431KB (Nucleo-32): follow `boards/bench_common/BRINGUP_NUCLEO_G431KB.md`** and define
-`BOARD_HW_NUCLEO_G431KB`. For a Nucleo-64 instead, build with `-DBOARD_NO_HW_PROFILE` and read on.
-
-### On two Nucleo Testboards
-
-Two G4 Nucleo-64s, two 3.3 V transceivers (standby pin tied low), twisted pair, 120 Ω at each end, common ground. PA12 = FDCAN1_TX → TXD, PA11 = FDCAN1_RX ← RXD. A USB-CAN adapter (gs_usb) on the bus is strongly recommended.
-
-| Board | Folder | Behaviour |
-|---|---|---|
-| Controller (node 1) | `boards/bench_controller/` | **Boots killed.** B1 toggles kill/arm. Publishes `cuauv.Kill` at 20 Hz and instantly on change. LED on = publishing armed, slow blink = publishing killed. |
-| Node (node 10) | `boards/bench_node/` | LED on = armed, off = killed, **fast blink = bus trouble** (error-passive: no ACKs / wiring / bit rate). |
-
-Per board, in CubeMX: FDCAN1 classic on PA11/PA12, FDCAN clock = HSE, NVIC FDCAN1 interrupt 0. Then add the auvCAN sources (next section) plus `boards/bench_common/bsp_g4.c` and that board's `app.c`, with include paths `boards/<app>/` and `boards/bench_common/`. LED (PA5) and button (PC13) are set up by `bsp_g4.c`, no CubeMX needed. **Set `BOARD_FDCAN_CLOCK_HZ` in each `board_config.h` to your HSE** (default 24 MHz). If the controller toggles on button *release*, set `BOARD_BTN_ACTIVE_HIGH 0`.
-
-Expected results:
-1. Power both: node LED off, controller LED slow-blinking. `bench.py monitor can0` lists nodes 1 and 10.
-2. Press B1 → both LEDs solid on within ~30 ms.
-3. Press B1 again → node LED off within ~30 ms.
-4. Arm, then unplug the controller's CANH/CANL → node LED off after **~250 ms** (watchdog).
-5. Reset the controller → it boots killed; the node stays off until you press B1.
-
-The same two apps run on your laptop, no hardware:
-```bash
-./build/bench_node_linux &
-./build/bench_controller_linux &          # prints its pid
-kill -USR1 <controller pid>               # = press B1
-python3 tools/bench.py monitor mcast:0
-```
-With `BOARD_REQUIRE_HOST=1` (`bench_controller_host_linux`) the controller only arms while `cuauv.HostHeartbeat` from node 2 is fresh: try `python3 tools/bench.py host mcast:0` (and `--soft-kill`).
-
-## Putting it on a G4 board
-
-1. **CubeMX**: enable FDCAN1 (classic). Clock mux = **HSE** or PLL from HSE (never HSI). NVIC: enable **FDCAN1 interrupt 0** (interrupt 1 is unused; every FDCAN interrupt stays on line 0 so one ISR feeds both RX rings). Compare against `boards/template/cubemx_reference/fdcan_msp_reference.c`.
-2. Add to the project:
-   - sources: `core/*.c`, `ports/stm32g4/auvcan_port_g4.c`, `third_party/libcanard/canard.c`, and from `generated/src/`: `uavcan.protocol.NodeStatus.c`, `uavcan.protocol.GetNodeInfo_{req,res}.c`, `uavcan.protocol.RestartNode_{req,res}.c`, `cuauv.Kill.c`, plus whatever your board publishes.
-   - include paths: `core/`, `ports/stm32g4/`, `third_party/libcanard/`, `generated/include/`
-3. Copy `boards/template/{app.c,app.h,board_config.h}`, set the node ID, name and `BOARD_FDCAN_CLOCK_HZ`, then call `app_setup()` / `app_loop()` from `main.c`.
-   For an existing app, `tools/export_cubeide.sh controller|node|thruster <project>` copies exactly the files it needs (core, port, libcanard, its DSDL sources, BSP, app) into `<project>/auvcan/` and prints the include paths.
-4. The port **owns** `HAL_FDCAN_RxFifo0Callback`, `HAL_FDCAN_RxFifo1Callback` and `HAL_FDCAN_ErrorStatusCallback`. Don't define them anywhere else.
-
-**Exclude from the CubeIDE build:** `ports/sim/`, `ports/linux_mcast/`, `tests/`, `tools/`, `boards/bench_common/bsp_linux.c`, `boards/template/cubemx_reference/` (and any `boards/*` you aren't building). CubeIDE compiles every `.c` it can see.
-
-Measured footprint (STM32G431, `-Os`, including the HAL and a 2 KB stack): core ≈ **14.2 KB flash, 6.7 KB RAM**; bench controller with host heartbeat ≈ 15.3 KB / 6.8 KB.
-
 ## Bring-up checklist
 
 | Stage | Setup | Pass when |
