@@ -100,7 +100,7 @@ the BOOT0 pin) and enabling FDCAN1 interrupt 0 (the Deft CubeMX project polls an
 **On NUCLEO-G431KB (Nucleo-32): follow `boards/bench_common/BRINGUP_NUCLEO_G431KB.md`** and define
 `BOARD_HW_NUCLEO_G431KB`. For a Nucleo-64 instead, build with `-DBOARD_NO_HW_PROFILE` and read on.
 
-### On two Nucleos
+### On two Nucleo Testboards
 
 Two G4 Nucleo-64s, two 3.3 V transceivers (standby pin tied low), twisted pair, 120 Ω at each end, common ground. PA12 = FDCAN1_TX → TXD, PA11 = FDCAN1_RX ← RXD. A USB-CAN adapter (gs_usb) on the bus is strongly recommended.
 
@@ -163,33 +163,3 @@ Measured footprint (STM32G431, `-Os`, including the HAL and a 2 KB stack): core 
 - Never run two node-2s either: `bench.py thrust` / `host`, `selftest --thruster` and `sub.py` all act as the Jetson. Node IDs are not checked on the bus; two nodes with one ID just corrupt each other's traffic.
 - Thrusters accept `RawCommand` only from node 2, and only if the array covers their slice (`cmd[0..2]` A, `cmd[3..5]` B). No command for 200 ms = ramp down to 0 and `stale`, but still armed.
 - `cuauv.*` IDs live in **20600–20699**. The rest of 20000–21000 is partly taken by ArduPilot/com/cuav/mppt types that ship with pydronecan and the GUI Tool, which refuse to load duplicates.
-
-## Changing DSDL
-
-1. Edit or add `dsdl/cuauv/<ID>.<Name>.uavcan` (the filename prefix is the type ID; stay in 20600–20699).
-2. Regenerate. The generator needs empy 3.3.4, which won't build against a system Python, so use a venv:
-   ```bash
-   tools/fetch_deps.sh
-   python3 -m venv .gen && .gen/bin/pip install empy==3.3.4 pexpect
-   .gen/bin/python third_party/dronecan_dsdlc/dronecan_dsdlc.py -O generated \
-       third_party/dronecan_dsdl/uavcan dsdl/cuauv
-   ```
-3. Commit `dsdl/` and `generated/` together; add any new `generated/src/*.c` to `DSDL_SOURCES` in `CMakeLists.txt` and to the board projects that use it.
-4. Rebuild: `tests/dsdl_sizes.c` fails the build if a change alters a type's frame count (update it deliberately when you mean to).
-5. Reflash every node that uses the type. Python tools load `dsdl/cuauv/` at start-up and need nothing else.
-
-A changed field list changes the type's signature. Multi-frame types then fail their CRC on any node built from the old definition; single-frame types (Kill, HostHeartbeat, ThrusterStatus) are caught only by the decoder's length check, so an old node silently drops a new Kill and never arms. Check that both sides agree:
-```bash
-grep "KILL_SIGNATURE " generated/include/cuauv.Kill.h
-python3 -c "import dronecan; dronecan.load_dsdl('dsdl/cuauv'); print(hex(dronecan.TYPENAMES['cuauv.Kill'].get_data_type_signature()))"
-```
-
-## macOS notes
-
-- **ASan aborts at start-up** (`CHECK failed: sanitizer_malloc_mac.inc`) under conda: build with `-DAUVCAN_SANITIZE=OFF`, or `conda deactivate` and rebuild with `CC=/usr/bin/clang` after `rm -rf build`.
-- **Nothing shows on `mcast:0`**: give the terminal app Local Network access (System Settings → Privacy & Security → Local Network), then add a loopback route for the multicast group. The route is lost on reboot:
-  ```bash
-  sudo route -n add -net 239.0.0.0/8 -interface lo0
-  ```
-- The mcast port sends with multicast TTL 0, so the C nodes' traffic never leaves your machine. pydronecan (bench.py, sub.py) still sends with TTL 1; with the loopback route above, that stays local too. Without it, two people on one network running `mcast:0` share a bus.
-- Don't type the `< >` around placeholders like `<controller pid>`: zsh reads them as redirection. `kill -USR1 $(pgrep bench_controller)` finds the pid for you.
