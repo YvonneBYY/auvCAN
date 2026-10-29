@@ -104,7 +104,7 @@ The table's STATE comes from the fastest source: ThrusterStatus and Kill at 20 H
 | 4b Thruster | thruster firmware, PWM pins on a scope (no ESC yet) | `bench.py selftest can0 10 --actuator --thruster` all PASS; 1500 µs at boot and within one period of a kill |
 | 5 Controller | controller firmware + gs_usb bridge (`BOARD_REQUIRE_HOST=1`) | Jetson sees `can0`; stopping HostHeartbeat kills the bus *(gs_usb bridge not in this drop)* |
 
-## Design rules worth knowing
+## Notes
 
 - **Actuators boot killed** and arm only on a fresh `cuauv.Kill(armed)` **from node 1**. Silence > 250 ms, an explicit kill, or a stuck sequence number all kill.
 - One timestamp per `auvcan_poll()`. Handlers that feed an `auvcan_fresh_t` should use `can->poll_now_us`. `auvcan_fresh_ok()` also treats a slightly-older "now" as just fed (see the regression test for why).
