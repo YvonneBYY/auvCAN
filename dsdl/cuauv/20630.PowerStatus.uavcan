@@ -1,0 +1,12 @@
+#
+# Publisher: Power (node 21), 10 Hz.
+#
+float16 vin_v
+float16 vout_v
+float16 current_a
+float16 v12_v
+float16 v5_v
+bool killed
+uint2 restart_state  # Orion isRestarting: 0/1/2
+bool overcurrent
+void4

@@ -1,0 +1,3 @@
+dronecan/libcanard @ 601ed35467e0ac38819df17cd7c918de19f62d58
+https://github.com/dronecan/libcanard
+Only the three core files are vendored; drivers/, tests/, canard/ (C++), examples/ are intentionally omitted.

@@ -1,0 +1,9 @@
+#
+# Publisher: Acoustics (node 31), 1 Hz.
+#
+uint16 track_freq_khz
+uint16 comms_freq_khz
+uint8 freq_select
+bool transmit_active
+bool transmission_done
+void6

@@ -1,0 +1,7 @@
+#
+# Publisher: Acoustics (node 31), once per ping, <= 10 Hz.
+#
+float16 heading_deg
+float16 elevation_deg
+uint8 confidence
+uint8 pinger_id

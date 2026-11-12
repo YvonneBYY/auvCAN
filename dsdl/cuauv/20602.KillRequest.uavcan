@@ -1,0 +1,20 @@
+#
+# Secondary kill request.
+# Publishers: BMB (node 20): 2 Hz while active, and on every change; clears when it
+#             stops (not latched).
+#             Operator via the auv_controller gateway (node 3, REASON_OPERATOR):
+#             active=true LATCHES the kill; it clears only on active=false from
+#             node 3, or when the hard-kill switch is put back to killed.
+# Consumer: the power board (node 1), which folds it into cuauv.Kill.node_kill.
+# A KillRequest can only kill, never arm.
+#
+uint8 REASON_BATTERY_FAULT = 1
+uint8 REASON_OVERTEMP      = 2
+uint8 REASON_UNDERVOLTAGE  = 4
+uint8 REASON_OVERCURRENT   = 8
+uint8 REASON_OPERATOR      = 16   # remote operator kill from the debug gateway (node 3)
+
+bool active
+void7
+uint8 reason        # bitmask of REASON_*
+uint8 seq

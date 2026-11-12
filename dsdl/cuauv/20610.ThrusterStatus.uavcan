@@ -1,0 +1,9 @@
+#
+# Thruster board output. Publisher: the thruster board (node 10), 20 Hz.
+# One board drives all 8 thrusters: applied[i] is thruster T(i+1), i.e.
+# RawCommand.cmd[i]. 17 bytes: a 3-frame transfer.
+#
+int16[8] applied    # output after ramp, Orion units -255..255; 0 while killed
+bool killed
+bool stale          # no RawCommand for 200 ms
+void6
